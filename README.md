@@ -19,6 +19,16 @@ py -3 synth.py paper.pdf --pages  just show the per-page extraction
 py -3 synth.py --check            is everything this needs present
 ```
 
+## Where it came from
+
+Started from [Matthew Park's synthesis](https://github.com/mattypark/ai-synthesis-research-paper-idea).
+Same idea, deliberately. His is a Next.js app that needs an `ANTHROPIC_API_KEY`;
+this is one Python file with no dependencies that runs on a Claude subscription.
+
+The one thing added: his validates that an anchor is **in range** and drops the
+rest to null. This does that, then scores the claim against what is actually
+printed on that page - because in range is not the same as on that page.
+
 ## What it is not
 
 Not a paper summariser you should trust unread — a claim marked `unverified`
