@@ -28,8 +28,9 @@ replacement for reading a blog post *about* the paper.
 
 ## Dependencies
 
-None in Python. Text comes from `pdftotext`, one page at a time — which is what
-makes an anchor mean anything. The model call goes through `claude -p` with the
+None in Python. Text comes from `pdftotext`, split back into pages on the form
+feeds it writes between them — which is what makes an anchor mean anything. The
+model call goes through `claude -p` with the
 flags that strip CLAUDE.md, skills, plugins and MCP definitions out of the
 request: measured at **$0.0017 a call** here against **$0.0240** without them.
 

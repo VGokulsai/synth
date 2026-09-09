@@ -18,7 +18,8 @@ Nothing here can label a claim false, so nothing here does.
     py -3 synth.py --check                is everything this needs present
 
 No Python dependencies. Text comes from `pdftotext`, which is already on this
-machine, one page at a time so a claim can say "p.7" and mean it. The model
+machine, split back into pages on the form feeds it writes between them, so a
+claim can say "p.7" and mean the printed page seven. The model
 call goes through `claude -p` on the subscription, with the flags that strip
 CLAUDE.md, skills, plugins and MCP definitions out of the request - measured
 at $0.0017 a call here against $0.0240 without them.
@@ -76,39 +77,44 @@ def have(command):
         return False
 
 
-def page_count(pdf):
-    """How many pages, found by walking until pdftotext returns nothing.
-
-    pdfinfo is not on this machine and is a second dependency to require for
-    one integer, so this asks the tool that is here.
-    """
-    low, high = 1, 2
-    while high < 4096 and page_text(pdf, high).strip():
-        low, high = high, high * 2
-    while low + 1 < high:
-        mid = (low + high) // 2
-        if page_text(pdf, mid).strip():
-            low = mid
-        else:
-            high = mid
-    return low
-
-
-def page_text(pdf, n):
-    try:
-        out = subprocess.run(["pdftotext", "-f", str(n), "-l", str(n), pdf, "-"],
-                             capture_output=True, timeout=60,
-                             creationflags=NO_WINDOW)
-        return out.stdout.decode("utf-8", "replace")
-    except Exception:
-        return ""
-
-
 def pages(pdf):
-    """[(page number, text)]. One call per page, because that is what makes an
-    anchor checkable later."""
-    total = page_count(pdf)
-    return [(n, page_text(pdf, n)) for n in range(1, total + 1)]
+    """([(page number, text)], "") for the whole paper, or (None, problem).
+
+    One call, split on the form feeds pdftotext writes between pages, so the
+    page numbers here are the printed ones and an anchor can be checked
+    against them.
+
+    This used to ask page by page and stop at the first page that came back
+    empty. That cannot work. pdftotext exits 0 with no output BOTH for a
+    blank page inside the paper and for a page past the end of it, so
+    emptiness does not mean the end of the document - and a paper with a
+    blank page in the middle was silently cut off there. A ten page paper
+    with pages four and five blank read as a three page paper, every anchor
+    past p.3 was then reported as "the model cited a page that does not
+    exist", and the run exited 0 as though it had gone fine.
+
+    A failed read is never an empty paper, so a non-zero exit is returned as
+    a problem instead of as pages.
+    """
+    try:
+        out = subprocess.run(["pdftotext", pdf, "-"], capture_output=True,
+                             timeout=300, creationflags=NO_WINDOW)
+    except Exception as exc:
+        return None, "could not run pdftotext: %s" % exc
+    if out.returncode != 0:
+        detail = out.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        return None, "pdftotext could not read %s: %s" % (
+            os.path.basename(pdf), detail[:200] or "exit %d" % out.returncode)
+    text = out.stdout.decode("utf-8", "replace")
+    chunks = text.split("\f")
+    # pdftotext ends the last page with a form feed too, so the split leaves
+    # one empty tail that is not a page. Exactly one, and exactly empty - a
+    # genuinely blank last page is a real page and is kept.
+    if chunks and chunks[-1] == "":
+        chunks.pop()
+    if not chunks:
+        return None, "pdftotext read %s and returned no pages" % os.path.basename(pdf)
+    return list(enumerate(chunks, 1)), ""
 
 
 def label(text):
@@ -189,9 +195,44 @@ def ask(prompt):
         return None, "claude returned no envelope: %s" % (out.stderr or "")[:200]
     if envelope.get("is_error"):
         return None, str(envelope.get("result") or "claude reported an error")
-    data = carve(envelope.get("result") or "")
+    result = envelope.get("result")
+    if not isinstance(result, str):
+        return None, "claude returned no reply text, got %s" % type(result).__name__
+    data = carve(result)
     if data is None:
-        return None, "the reply was not JSON: %s" % (envelope.get("result") or "")[:200]
+        return None, "the reply was not JSON: %s" % result[:200]
+    return check_shape(data, result)
+
+
+ANCHORED = ("findings", "limitations", "numbers")
+
+
+def check_shape(data, raw):
+    """(data, "") if the reply is the shape that was asked for, else (None, why).
+
+    A reply can parse as JSON and still be nothing this can check. `{"error":
+    "prompt is too long"}` is valid JSON, and it used to sail through to the
+    end and print "0 anchored claims, 0 dropped, 0 verified, 0 unverified" and
+    exit 0 - a total failure wearing the clothes of a clean read. A shape this
+    cannot check is a blocked run, not an empty paper.
+    """
+    if not isinstance(data, dict):
+        return None, "the reply was JSON but not an object: %s" % raw[:200]
+    for key in ANCHORED:
+        items = data.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            return None, ("the reply's %s was %s, not a list, so no anchor in "
+                          "it can be checked" % (key, type(items).__name__))
+        bad = [i for i in items if not isinstance(i, dict)]
+        if bad:
+            return None, ("the reply's %s holds %d entry(s) that are not "
+                          "objects, so they carry no page to check"
+                          % (key, len(bad)))
+    if not any(isinstance(data.get(k), list) for k in ANCHORED):
+        return None, ("the reply carries no findings, limitations or numbers, "
+                      "so there is nothing anchored to check: %s" % raw[:200])
     return data, ""
 
 
@@ -203,7 +244,7 @@ def check_anchors(data, total):
     dropped and counted rather than quietly kept.
     """
     dropped = []
-    for key in ("findings", "limitations", "numbers"):
+    for key in ANCHORED:
         for item in (data.get(key) or []):
             if not isinstance(item, dict):
                 continue
@@ -211,7 +252,15 @@ def check_anchors(data, total):
             if page is None:
                 continue
             try:
-                page = int(page)
+                # int() is too willing: it turns True into page 1 and 7.9 into
+                # page 7, both of which are values this could not read being
+                # quietly rewritten as ones it could.
+                if isinstance(page, bool):
+                    raise ValueError("a boolean is not a page number")
+                number = int(page)
+                if float(page) != number:
+                    raise ValueError("%r is not a whole page number" % (page,))
+                page = number
             except Exception:
                 item["page"] = None
                 dropped.append((key, item.get("claim") or item.get("value")))
@@ -320,7 +369,7 @@ def check_content(data, paper):
     cites. Returns the count per state."""
     index = {n: _page_index(t) for n, t in paper}
     counts = {"verified": 0, "unverified": 0, "skipped": 0}
-    for key in ("findings", "limitations", "numbers"):
+    for key in ANCHORED:
         for item in (data.get(key) or []):
             if not isinstance(item, dict):
                 continue
@@ -396,7 +445,7 @@ def to_markdown(data, source, total, dropped):
         out.append("")
         out.extend("- %s" % g for g in gaps)
         out.append("")
-    unverified = [(k, i) for k in ("findings", "limitations", "numbers")
+    unverified = [(k, i) for k in ANCHORED
                   for i in (data.get(k) or [])
                   if isinstance(i, dict) and i.get("anchor_check") == "unverified"]
     if unverified:
@@ -459,7 +508,12 @@ def main():
               "\n  not a paper with no text in it.\n", file=sys.stderr)
         return 2
 
-    paper = pages(args.pdf)
+    paper, problem = pages(args.pdf)
+    if problem:
+        print("\n  BLOCKED: %s" % problem, file=sys.stderr)
+        print("  The paper was not read, so there is nothing to check.\n",
+              file=sys.stderr)
+        return 2
     total = len(paper)
     empty = sum(1 for _, t in paper if not t.strip())
 
@@ -469,10 +523,11 @@ def main():
             print("  p.%-3d %5d words  %s" % (n, words, ", ".join(label(text))))
         return 0
 
-    if total == 0 or empty == total:
-        print("\n  BLOCKED: no text came out of any page. This is probably a"
-              "\n  scanned PDF, which needs OCR. It is not an empty paper.\n",
-              file=sys.stderr)
+    if empty == total:
+        # pdftotext exited 0, so it read the file and there was no text in it.
+        print("\n  BLOCKED: pdftotext read all %d pages and found no text on"
+              "\n  any of them. This is probably a scanned PDF, which needs"
+              "\n  OCR. It is not an empty paper.\n" % total, file=sys.stderr)
         return 2
 
     print("  %d pages, %d with no text" % (total, empty))
@@ -502,13 +557,20 @@ def main():
             fh.write(to_markdown(data, args.pdf, total, dropped))
         print("  wrote %s.synthesis.md" % os.path.basename(stem))
 
-    anchored = sum(1 for k in ("findings", "limitations", "numbers")
+    anchored = sum(1 for k in ANCHORED
                    for i in (data.get(k) or [])
                    if isinstance(i, dict) and i.get("page"))
     print("  %d anchored claims, %d anchors dropped as out of range"
           % (anchored, len(dropped)))
     print("  %d verified on the cited page, %d unverified, %d too short to check"
           % (counts["verified"], counts["unverified"], counts["skipped"]))
+    if not anchored:
+        # A zero has to say which zero it is. This one is real: the reply came
+        # back in the shape that was asked for and carried no anchored claim,
+        # which is the model answering "nothing", not a check that failed.
+        # Every way of failing to get here exits 2 with a BLOCKED line above.
+        print("  that is a real zero: %s read all %d pages, answered in the"
+              " shape asked for, and anchored nothing" % (MODEL, total))
     if dropped:
         print("  those claims are unsourced - the model cited a page that does"
               " not exist")
